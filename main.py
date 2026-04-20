@@ -1,7 +1,7 @@
 import logging
-import sqlite3
+import aiosqlite
 import time
-import os
+import asyncio
 from telegram import Update, ChatPermissions, ReactionTypeEmoji
 from telegram.ext import ApplicationBuilder, MessageHandler, filters, ContextTypes
 from telegram.error import TelegramError, BadRequest, Forbidden
@@ -10,11 +10,14 @@ from simpleeval import simple_eval, InvalidExpression
 # --- 配置區 ---
 TOKEN = "0123456789:ABCD1234EFGH5678IJKLMNOPQRSTUVWX"  # 請替換成你的 Telegram Bot Token
 DB_NAME = "counting_bot.db"
-MUTE_DURATION = 10  # 禁言秒數 (1小時)
+MUTE_DURATION = 60  # 禁言秒數
 
 # 白名單設定 (設為 None 則不限制)
-ALLOWED_CHAT_ID = -100123456789  # 限制的群組 ID
-ALLOWED_TOPIC_ID = 1234           # 限制的 Topic ID，若無 Topic 請設為 None
+ALLOWED_CHAT_ID = -100123456789  # 限制的群組 ID (通常以 -100 開頭)
+ALLOWED_TOPIC_ID = 1234           # 限制的 Topic ID (即討論串 ID)，若無 Topic 請設為 None
+
+# 記憶體快取：儲存各群組狀態 { chat_id: {"current_number": int, "last_user_id": int} }
+cache = {}
 
 # 設定日誌
 logging.basicConfig(
@@ -23,42 +26,40 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# --- 資料庫邏輯 ---
-def init_db():
-    """初始化 SQLite 資料庫"""
-    conn = sqlite3.connect(DB_NAME)
-    cursor = conn.cursor()
-    cursor.execute('''
-        CREATE TABLE IF NOT EXISTS chat_state (
-            chat_id INTEGER PRIMARY KEY,
-            current_number INTEGER DEFAULT 0,
-            last_user_id INTEGER DEFAULT NULL
-        )
-    ''')
-    conn.commit()
-    conn.close()
+# --- 資料庫與快取邏輯 ---
+async def init_db_and_cache():
+    """初始化資料庫並將所有資料載入記憶體快取"""
+    async with aiosqlite.connect(DB_NAME) as db:
+        await db.execute('''
+            CREATE TABLE IF NOT EXISTS chat_state (
+                chat_id INTEGER PRIMARY KEY,
+                current_number INTEGER DEFAULT 0,
+                last_user_id INTEGER DEFAULT NULL
+            )
+        ''')
+        await db.commit()
+        
+        async with db.execute('SELECT chat_id, current_number, last_user_id FROM chat_state') as cursor:
+            async for row in cursor:
+                cache[row[0]] = {
+                    "current_number": row[1],
+                    "last_user_id": row[2]
+                }
+    logger.info(f"資料庫初始化完成，已載入 {len(cache)} 筆群組資料")
 
-def get_state(chat_id):
-    """取得該群組目前的報數狀態"""
-    conn = sqlite3.connect(DB_NAME)
-    cursor = conn.cursor()
-    cursor.execute('SELECT current_number, last_user_id FROM chat_state WHERE chat_id = ?', (chat_id,))
-    row = cursor.fetchone()
-    conn.close()
-    if row:
-        return {"current_number": row[0], "last_user_id": row[1]}
-    return {"current_number": 0, "last_user_id": None}
-
-def update_state(chat_id, current_number, last_user_id):
-    """更新該群組的報數狀態"""
-    conn = sqlite3.connect(DB_NAME)
-    cursor = conn.cursor()
-    cursor.execute('''
-        INSERT OR REPLACE INTO chat_state (chat_id, current_number, last_user_id)
-        VALUES (?, ?, ?)
-    ''', (chat_id, current_number, last_user_id))
-    conn.commit()
-    conn.close()
+async def sync_to_db(chat_id):
+    """將快取同步至資料庫 (非同步執行)"""
+    state = cache.get(chat_id)
+    if not state: return
+    try:
+        async with aiosqlite.connect(DB_NAME) as db:
+            await db.execute('''
+                INSERT OR REPLACE INTO chat_state (chat_id, current_number, last_user_id)
+                VALUES (?, ?, ?)
+            ''', (chat_id, state["current_number"], state["last_user_id"]))
+            await db.commit()
+    except Exception as e:
+        logger.error(f"DB Sync Error: {e}")
 
 # --- 核心業務邏輯 ---
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -69,62 +70,70 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = msg.chat_id
     topic_id = msg.message_thread_id 
     
-    if ALLOWED_CHAT_ID is not None and chat_id != ALLOWED_CHAT_ID:
-        return
-
-    if ALLOWED_TOPIC_ID is not None and topic_id != ALLOWED_TOPIC_ID:
-        return
+    # 權限與白名單過濾
+    if ALLOWED_CHAT_ID is not None and chat_id != ALLOWED_CHAT_ID: return
+    if ALLOWED_TOPIC_ID is not None and topic_id != ALLOWED_TOPIC_ID: return
     
     user_id = msg.from_user.id
     user_name = msg.from_user.first_name
     text = msg.text.strip()
 
-    # 1. 嘗試解析算式
+    # 1. 解析訊息
+    is_numeric_input = False
+    evaluated_val = None
+
     try:
-        # 限制長度以防惡意計算
-        if len(text) > 50:
-            return
-            
-        # 執行計算
-        result_raw = simple_eval(text)
-        
-        # 判斷是否為有效的數字結果
-        if not isinstance(result_raw, (int, float)):
-            return
-        
-        result = int(result_raw)
-        # 確保是整數報數，不接受 1.5 之類的
-        if result != result_raw:
-            return
-            
-    except (InvalidExpression, SyntaxError, ZeroDivisionError, Exception):
-        # 捕捉所有解析錯誤，代表這不是一個有效的報數，直接忽略不計
+        if len(text) <= 50: # 限制長度
+            res = simple_eval(text)
+            if isinstance(res, (int, float)):
+                is_numeric_input = True
+                evaluated_val = res
+    except:
+        return
+
+    if not is_numeric_input:
         return
 
     # 2. 獲取當前進度
-    state = get_state(chat_id)
+    if chat_id not in cache:
+        cache[chat_id] = {"current_number": 0, "last_user_id": None}
+    
+    state = cache[chat_id]
     current_num = state["current_number"]
     last_user = state["last_user_id"]
     target_num = current_num + 1
 
-    # 3. 邏輯檢查
+    # 3. 判斷邏輯
     try:
-        # A. 檢查是否連續報數
+        is_integer = False
+        final_int_val = 0
+        
+        if isinstance(evaluated_val, int):
+            is_integer = True
+            final_int_val = evaluated_val
+        elif isinstance(evaluated_val, float) and evaluated_val.is_integer():
+            is_integer = True
+            final_int_val = int(evaluated_val)
+
         if user_id == last_user:
             await msg.reply_text(f"⚠️ {user_name}，你不能連續報數！")
             return
 
-        # B. 數字正確
-        if result == target_num:
-            update_state(chat_id, target_num, user_id)
+        if is_integer and final_int_val == target_num:
+            cache[chat_id] = {"current_number": target_num, "last_user_id": user_id}
+            asyncio.create_task(sync_to_db(chat_id))
             try:
                 await msg.set_reaction(reaction=[ReactionTypeEmoji(emoji="👍")])
             except:
                 pass
-            
-        # C. 數字錯誤
         else:
-            update_state(chat_id, 0, None)
+            cache[chat_id] = {"current_number": 0, "last_user_id": None}
+            asyncio.create_task(sync_to_db(chat_id))
+            
+            error_reason = f"應該是 {target_num}"
+            if not is_integer:
+                error_reason = f"報數必須是整數，不接受「{evaluated_val}」"
+
             until_date = int(time.time() + MUTE_DURATION)
             try:
                 await context.bot.restrict_chat_member(
@@ -134,20 +143,29 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     until_date=until_date
                 )
                 await msg.reply_text(
-                    f"💀 數錯了！結果應該是 {target_num}。\n"
-                    f"{user_name} 已被禁言 1 小時，報數重頭開始！"
+                    f"💀 數錯了！({error_reason})\n"
+                    f"{user_name} 已被禁言 1 小時，報數重新從 1 開始！"
                 )
             except (Forbidden, BadRequest):
-                await msg.reply_text(f"⚠️ 數錯了！結果應該是 {target_num}。但我權限不足或你是管理員，無法禁言。數字已重置。")
+                await msg.reply_text(f"⚠️ 數錯了！({error_reason})。由於權限限制，無法禁言你，但數字已重置為 1。")
 
     except TelegramError as te:
-        logger.error(f"Telegram API 錯誤: {te}")
+        logger.error(f"Telegram API Error: {te}")
     except Exception as ge:
-        logger.error(f"一般錯誤: {ge}")
+        logger.error(f"General Error: {ge}")
+
+async def post_init(application: Application):
+    """在機器人啟動前執行的非同步初始化"""
+    await init_db_and_cache()
 
 if __name__ == '__main__':
-    init_db()
-    app = ApplicationBuilder().token(TOKEN).build()
+    # 使用 run_polling() 是最穩定的做法，它會自動處理事件迴圈
+    app = ApplicationBuilder().token(TOKEN).post_init(post_init).build()
+    
+    # 註冊處理器
     app.add_handler(MessageHandler(filters.TEXT & (~filters.COMMAND) & filters.ChatType.GROUPS, handle_message))
-    logger.info("機器人已啟動 (修正匯入錯誤後)...")
+    
+    logger.info("機器人已啟動 (修正 start_polling 錯誤)...")
+    
+    # run_polling 內部會處理 loop.run_until_complete，不需要手動 asyncio.run(main())
     app.run_polling()
