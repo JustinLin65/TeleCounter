@@ -17,7 +17,7 @@ MUTE_DURATION = 60  # 禁言秒數
 
 # 白名單設定 (設為 None 則不限制)
 ALLOWED_CHAT_ID = -100123456789  # 群組 ID
-ALLOWED_TOPIC_ID = 1234           # Topic ID
+ALLOWED_TOPIC_ID = 1234           # 限制的 Topic ID (即討論串 ID)，若無 Topic 請設為 None
 
 # 記憶體快取：儲存各群組狀態 { chat_id: {"current_number": int, "last_user_id": int} }
 cache = {}
@@ -65,23 +65,16 @@ async def sync_to_db(chat_id):
 def safe_math_eval(text):
     """使用 SymPy 安全解析數學算式"""
     # 1. 預處理符號
-    # 將 ^ 換成 **
     expr_str = text.replace('^', '**')
-    # 將 √ 轉換為 sqrt()
     # 支援 √9 -> sqrt(9) 以及 √(2+2) -> sqrt((2+2))
     expr_str = re.sub(r'√\s*(\((?:[^()]|\([^()]*\))*\)|[\d\.]+)', r'sqrt(\1)', expr_str)
     
-    # 如果還剩下單獨的 √ 符號，說明格式錯誤
     if '√' in expr_str:
         return None
 
     try:
-        # 使用 SymPy 的解析器，並加入「隱含乘法」支援 (例如 2(3+1) -> 8)
         transformations = standard_transformations + (implicit_multiplication_application,)
-        # 限制解析環境，只允許數值運算
         expr = parse_expr(expr_str, transformations=transformations, evaluate=True)
-        
-        # 取得數值結果 (evalf)
         result = expr.evalf()
         return result
     except:
@@ -96,7 +89,6 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = msg.chat_id
     topic_id = msg.message_thread_id 
     
-    # 白名單過濾
     if ALLOWED_CHAT_ID is not None and chat_id != ALLOWED_CHAT_ID: return
     if ALLOWED_TOPIC_ID is not None and topic_id != ALLOWED_TOPIC_ID: return
     
@@ -104,8 +96,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_name = msg.from_user.first_name
     text = msg.text.strip()
 
-    # 1. 從文字中提取第一個可能的數學區塊
-    # Regex 包含數字、運算符、√、^ 與括號
+    # 1. 提取數學區塊
     match = re.search(r'([\d√\(][\d\+\-\*\/\(\)\.\^\√\s]*[\d\)])|(\b\d+\b)', text)
     if not match:
         return
@@ -113,7 +104,6 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     potential_expr = match.group(0).strip()
     evaluated_val = safe_math_eval(potential_expr)
 
-    # 如果解析不出有效數字，視為一般聊天
     if evaluated_val is None:
         return
 
@@ -128,22 +118,17 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     # 3. 判斷邏輯
     try:
-        # 使用 SymPy 判斷是否為整數
-        is_integer = False
-        val_as_int = 0
-        
-        # 容許微小的浮點誤差 (例如 3.0000000000001)
-        if abs(evaluated_val - round(evaluated_val)) < 1e-10:
-            is_integer = True
-            val_as_int = int(round(evaluated_val))
+        # --- 執行無條件捨去 (Floor) ---
+        # 將 SymPy 結果轉為 float 後使用 math.floor
+        val_after_floor = math.floor(float(evaluated_val))
 
         # 檢查連續報數
         if user_id == last_user:
             await msg.reply_text(f"⚠️ {user_name}，你不能連續報數！")
             return
 
-        # 判斷對錯
-        if is_integer and val_as_int == target_num:
+        # 判斷對錯 (比較捨去後的結果是否等於目標數字)
+        if val_after_floor == target_num:
             # --- 答對了 ---
             cache[chat_id] = {"current_number": target_num, "last_user_id": user_id}
             asyncio.create_task(sync_to_db(chat_id))
@@ -159,11 +144,9 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 await msg.set_reaction(reaction=[ReactionTypeEmoji(emoji="👎")])
             except: pass
 
-            error_reason = f"應該是 {target_num}"
-            if not is_integer:
-                # 使用 :g 格式化去掉多餘的 0，並確保轉換為 float 以進行標準格式化
-                formatted_val = f"{float(evaluated_val):g}"
-                error_reason = f"報數必須是整數，不接受「{formatted_val}」"
+            # 格式化顯示原始計算結果（去掉多餘 0）
+            raw_val_str = f"{float(evaluated_val):g}"
+            error_reason = f"應該是 {target_num} (你的計算結果捨去後為 {val_after_floor}，原始值為 {raw_val_str})"
 
             until_date = int(time.time() + MUTE_DURATION)
             try:
@@ -174,11 +157,11 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     until_date=until_date
                 )
                 await msg.reply_text(
-                    f"💀 數錯了！({error_reason})\n"
+                    f"💀 數錯了！\n{error_reason}\n"
                     f"{user_name} 已被禁言 1 小時，報數重新從 1 開始！"
                 )
             except (Forbidden, BadRequest):
-                await msg.reply_text(f"⚠️ 數錯了！({error_reason})。數字已重置為 1。")
+                await msg.reply_text(f"⚠️ 數錯了！\n{error_reason}\n數字已重置為 1。")
 
     except TelegramError as te:
         logger.error(f"Telegram API Error: {te}")
@@ -189,7 +172,6 @@ async def post_init(application: Application):
     await init_db_and_cache()
 
 if __name__ == '__main__':
-    # 注意：需要安裝 sympy, aiosqlite, python-telegram-bot
     app = ApplicationBuilder().token(TOKEN).post_init(post_init).build()
     app.add_handler(MessageHandler(filters.TEXT & (~filters.COMMAND) & filters.ChatType.GROUPS, handle_message))
     
