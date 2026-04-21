@@ -6,8 +6,8 @@ import re
 import math
 import sympy
 from sympy.parsing.sympy_parser import parse_expr, standard_transformations, implicit_multiplication_application
-from telegram import Update, ChatPermissions, ReactionTypeEmoji
-from telegram.ext import ApplicationBuilder, MessageHandler, filters, ContextTypes, Application
+from telegram import Update, ChatPermissions, ReactionTypeEmoji, BotCommand
+from telegram.ext import ApplicationBuilder, MessageHandler, CommandHandler, filters, ContextTypes, Application
 from telegram.error import TelegramError, BadRequest, Forbidden
 
 # --- 配置區 ---
@@ -33,6 +33,7 @@ logger = logging.getLogger(__name__)
 async def init_db_and_cache():
     """初始化資料庫並載入快取"""
     async with aiosqlite.connect(DB_NAME) as db:
+        # 群組報數進度表
         await db.execute('''
             CREATE TABLE IF NOT EXISTS chat_state (
                 chat_id INTEGER PRIMARY KEY,
@@ -40,15 +41,23 @@ async def init_db_and_cache():
                 last_user_id INTEGER DEFAULT NULL
             )
         ''')
+        # 使用者個人紀錄表
+        await db.execute('''
+            CREATE TABLE IF NOT EXISTS user_stats (
+                user_id INTEGER PRIMARY KEY,
+                username TEXT,
+                high_score INTEGER DEFAULT 0
+            )
+        ''')
         await db.commit()
         
         async with db.execute('SELECT chat_id, current_number, last_user_id FROM chat_state') as cursor:
             async for row in cursor:
                 cache[row[0]] = {"current_number": row[1], "last_user_id": row[2]}
-    logger.info(f"資料庫初始化完成，已載入 {len(cache)} 筆資料")
+    logger.info(f"資料庫初始化完成，已載入 {len(cache)} 筆群組進度資料")
 
-async def sync_to_db(chat_id):
-    """同步快取至資料庫"""
+async def sync_state_to_db(chat_id):
+    """同步群組進度至資料庫"""
     state = cache.get(chat_id)
     if not state: return
     try:
@@ -59,14 +68,38 @@ async def sync_to_db(chat_id):
             ''', (chat_id, state["current_number"], state["last_user_id"]))
             await db.commit()
     except Exception as e:
-        logger.error(f"DB Sync Error: {e}")
+        logger.error(f"DB Sync State Error: {e}")
+
+async def update_user_record(user_id, username, current_score):
+    """更新使用者個人最高紀錄"""
+    try:
+        async with aiosqlite.connect(DB_NAME) as db:
+            # 先檢查舊紀錄
+            async with db.execute('SELECT high_score FROM user_stats WHERE user_id = ?', (user_id,)) as cursor:
+                row = await cursor.fetchone()
+                old_high = row[0] if row else 0
+            
+            # 如果目前報數大於舊紀錄，則更新
+            if current_score > old_high:
+                await db.execute('''
+                    INSERT OR REPLACE INTO user_stats (user_id, username, high_score)
+                    VALUES (?, ?, ?)
+                ''', (user_id, username, current_score))
+                await db.commit()
+            elif row is None:
+                # 即使沒破紀錄，第一次參加也建立資料
+                await db.execute('''
+                    INSERT INTO user_stats (user_id, username, high_score)
+                    VALUES (?, ?, ?)
+                ''', (user_id, username, current_score))
+                await db.commit()
+    except Exception as e:
+        logger.error(f"DB Update Record Error: {e}")
 
 # --- 數學解析邏輯 ---
 def safe_math_eval(text):
     """使用 SymPy 安全解析數學算式"""
-    # 1. 預處理符號
     expr_str = text.replace('^', '**')
-    # 支援 √9 -> sqrt(9) 以及 √(2+2) -> sqrt((2+2))
     expr_str = re.sub(r'√\s*(\((?:[^()]|\([^()]*\))*\)|[\d\.]+)', r'sqrt(\1)', expr_str)
     
     if '√' in expr_str:
@@ -80,7 +113,29 @@ def safe_math_eval(text):
     except:
         return None
 
-# --- 核心業務邏輯 ---
+# --- 指令處理器 ---
+async def leaderboard_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """顯示排行榜"""
+    try:
+        async with aiosqlite.connect(DB_NAME) as db:
+            async with db.execute('SELECT username, high_score FROM user_stats ORDER BY high_score DESC LIMIT 10') as cursor:
+                rows = await cursor.fetchall()
+        
+        if not rows:
+            await update.message.reply_text("目前還沒有人報數喔！")
+            return
+
+        text = "🏆 **報數排行榜 (最高紀錄)**\n\n"
+        medals = ["🥇", "🥈", "🥉"]
+        for i, (name, score) in enumerate(rows):
+            rank_icon = medals[i] if i < 3 else f"{i+1}."
+            text += f"{rank_icon} {name or '神秘人'}: `{score}`\n"
+        
+        await update.message.reply_text(text, parse_mode="Markdown")
+    except Exception as e:
+        logger.error(f"Leaderboard Error: {e}")
+
+# --- 核心報數邏輯 ---
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not update.message or not update.message.text:
         return
@@ -93,7 +148,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if ALLOWED_TOPIC_ID is not None and topic_id != ALLOWED_TOPIC_ID: return
     
     user_id = msg.from_user.id
-    user_name = msg.from_user.first_name
+    user_name = msg.from_user.full_name # 使用全名
     text = msg.text.strip()
 
     # 1. 提取數學區塊
@@ -118,35 +173,33 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     # 3. 判斷邏輯
     try:
-        # --- 執行無條件捨去 (Floor) ---
-        # 將 SymPy 結果轉為 float 後使用 math.floor
         val_after_floor = math.floor(float(evaluated_val))
 
-        # 檢查連續報數
         if user_id == last_user:
             await msg.reply_text(f"⚠️ {user_name}，你不能連續報數！")
             return
 
-        # 判斷對錯 (比較捨去後的結果是否等於目標數字)
         if val_after_floor == target_num:
             # --- 答對了 ---
             cache[chat_id] = {"current_number": target_num, "last_user_id": user_id}
-            asyncio.create_task(sync_to_db(chat_id))
+            # 更新群組進度與使用者個人高分
+            asyncio.create_task(sync_state_to_db(chat_id))
+            asyncio.create_task(update_user_record(user_id, user_name, target_num))
+            
             try:
                 await msg.set_reaction(reaction=[ReactionTypeEmoji(emoji="👍")])
             except: pass
         else:
             # --- 答錯了 ---
             cache[chat_id] = {"current_number": 0, "last_user_id": None}
-            asyncio.create_task(sync_to_db(chat_id))
+            asyncio.create_task(sync_state_to_db(chat_id))
             
             try:
                 await msg.set_reaction(reaction=[ReactionTypeEmoji(emoji="👎")])
             except: pass
 
-            # 格式化顯示原始計算結果（去掉多餘 0）
             raw_val_str = f"{float(evaluated_val):g}"
-            error_reason = f"應該是 {target_num} (你的計算結果捨去後為 {val_after_floor}，原始值為 {raw_val_str})"
+            error_reason = f"應該是 {target_num} (你的結果捨去後為 {val_after_floor}，原始值 {raw_val_str})"
 
             until_date = int(time.time() + MUTE_DURATION)
             try:
@@ -158,7 +211,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 )
                 await msg.reply_text(
                     f"💀 數錯了！\n{error_reason}\n"
-                    f"{user_name} 已被禁言 1 小時，報數重新從 1 開始！"
+                    f"{user_name} 已被禁言 1 小時，數字歸 1。"
                 )
             except (Forbidden, BadRequest):
                 await msg.reply_text(f"⚠️ 數錯了！\n{error_reason}\n數字已重置為 1。")
@@ -169,11 +222,23 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         logger.error(f"General Error: {ge}")
 
 async def post_init(application: Application):
+    """初始化資料庫並設定指令清單"""
     await init_db_and_cache()
+    
+    # 向 Telegram 註冊指令清單
+    commands = [
+        BotCommand("leaderboard", "查看報數最高紀錄排行榜"),
+    ]
+    await application.bot.set_my_commands(commands)
+    logger.info("機器人指令清單已更新")
 
 if __name__ == '__main__':
     app = ApplicationBuilder().token(TOKEN).post_init(post_init).build()
+    
+    # 註冊指令處理器
+    app.add_handler(CommandHandler("leaderboard", leaderboard_command))
+    # 註冊訊息處理器
     app.add_handler(MessageHandler(filters.TEXT & (~filters.COMMAND) & filters.ChatType.GROUPS, handle_message))
     
-    logger.info("機器人已啟動...")
+    logger.info("機器人已啟動 (支援排行榜與指令選單)...")
     app.run_polling()
