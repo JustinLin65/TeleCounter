@@ -3,19 +3,20 @@ import aiosqlite
 import time
 import asyncio
 import re
+import math
 from telegram import Update, ChatPermissions, ReactionTypeEmoji
 from telegram.ext import ApplicationBuilder, MessageHandler, filters, ContextTypes, Application
 from telegram.error import TelegramError, BadRequest, Forbidden
 from simpleeval import simple_eval, InvalidExpression
 
 # --- 配置區 ---
-TOKEN = "0123456789:ABCD1234EFGH5678IJKLMNOPQRSTUVWX"  # 請替換成你的 Telegram Bot Token
+TOKEN = "0123456789:ABCD1234EFGH5678IJKLMNOPQRSTUVWXYZ"  # 請替換成你的 Telegram Bot Token
 DB_NAME = "counting_bot.db"
 MUTE_DURATION = 60  # 禁言秒數
 
 # 白名單設定 (設為 None 則不限制)
-ALLOWED_CHAT_ID = -1003690233630  # 群組 ID
-ALLOWED_TOPIC_ID = 2481           # Topic ID
+ALLOWED_CHAT_ID = -100123456789  # 群組 ID
+ALLOWED_TOPIC_ID = 1234           # Topic ID
 
 # 記憶體快取：儲存各群組狀態 { chat_id: {"current_number": int, "last_user_id": int} }
 cache = {}
@@ -79,28 +80,26 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_name = msg.from_user.first_name
     text = msg.text.strip()
 
-    # 1. 解析訊息：從文字中尋找第一個「算式或數字」區塊
+    # 1. 解析訊息
     is_numeric_input = False
     evaluated_val = None
 
-    # 正則表達式解釋：尋找第一個由數字或左括號開頭，後續可包含數字、運算符號與點的字串
-    # 這可以匹配出 "29 號" 中的 "29" 或 "目前是 1+1 喔" 中的 "1+1"
-    match = re.search(r'([\d\(\)][\d\+\-\*\/\(\)\. ]*)', text)
+    match = re.search(r'([sS][qQ][rR][tT]\s*\(.*?\)|[\d\(\)√][\d\+\-\*\/\(\)\.\^\√\s\w]*)', text)
     
     if match:
         potential_expr = match.group(1).strip()
+        potential_expr = potential_expr.replace('^', '**')
+        potential_expr = re.sub(r'√\s*([\d\.]+)', r'sqrt(\1)', potential_expr)
+
         try:
-            # 限制長度以防惡意過長算式
-            if len(potential_expr) <= 50:
-                res = simple_eval(potential_expr)
+            if len(potential_expr) <= 60:
+                res = simple_eval(potential_expr, functions={"sqrt": math.sqrt})
                 if isinstance(res, (int, float)):
                     is_numeric_input = True
                     evaluated_val = res
         except:
-            # 如果抓到的部分不是有效的算式（例如只是一顆孤單的左括號），則忽略
             pass
 
-    # 如果訊息中完全沒有數字或有效算式，則視為一般聊天，忽略不計
     if not is_numeric_input:
         return
 
@@ -125,12 +124,10 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             is_integer = True
             final_int_val = int(evaluated_val)
 
-        # 檢查連續報數
         if user_id == last_user:
             await msg.reply_text(f"⚠️ {user_name}，你不能連續報數！")
             return
 
-        # 判斷對錯
         if is_integer and final_int_val == target_num:
             # --- 答對了 ---
             cache[chat_id] = {"current_number": target_num, "last_user_id": user_id}
@@ -144,6 +141,13 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             cache[chat_id] = {"current_number": 0, "last_user_id": None}
             asyncio.create_task(sync_to_db(chat_id))
             
+            # 1. 給予 👎 反應
+            try:
+                await msg.set_reaction(reaction=[ReactionTypeEmoji(emoji="👎")])
+            except:
+                pass
+
+            # 2. 準備錯誤訊息與禁言
             error_reason = f"應該是 {target_num}"
             if not is_integer:
                 error_reason = f"報數必須是整數，不接受「{evaluated_val}」"
@@ -176,5 +180,5 @@ if __name__ == '__main__':
     app = ApplicationBuilder().token(TOKEN).post_init(post_init).build()
     app.add_handler(MessageHandler(filters.TEXT & (~filters.COMMAND) & filters.ChatType.GROUPS, handle_message))
     
-    logger.info("機器人已啟動 (支援嵌入式報數解析)...")
+    logger.info("機器人已啟動 (數錯會給 👎)...")
     app.run_polling()
